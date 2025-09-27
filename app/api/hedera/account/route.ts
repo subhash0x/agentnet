@@ -3,6 +3,21 @@ import { AccountCreateTransaction, Client, Hbar, PrivateKey } from "@hashgraph/s
 
 export const runtime = "nodejs";
 
+function parseOperatorKey(raw: string): PrivateKey {
+  let s = raw.trim();
+  if (s.startsWith("0x")) s = s.slice(2);
+  try {
+    return PrivateKey.fromStringDer(s);
+  } catch {}
+  try {
+    return PrivateKey.fromStringED25519(s);
+  } catch {}
+  try {
+    return PrivateKey.fromStringECDSA(s);
+  } catch {}
+  return PrivateKey.fromString(raw);
+}
+
 function getHederaClient(): Client {
   const network = (process.env.HEDERA_NETWORK || "testnet").toLowerCase();
   const operatorId = process.env.HEDERA_OPERATOR_ID;
@@ -16,7 +31,8 @@ function getHederaClient(): Client {
   else if (network === "previewnet") client = Client.forPreviewnet();
   else client = Client.forTestnet();
 
-  client.setOperator(operatorId, operatorKey);
+  const priv = parseOperatorKey(operatorKey);
+  client.setOperator(operatorId, priv);
   return client;
 }
 

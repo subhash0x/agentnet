@@ -1,17 +1,11 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+// Use system fonts to avoid build-time Google Fonts fetch in restricted environments
+// import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import Providers from "@/components/Providers";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
+const geistSans = { variable: "--font-geist-sans" } as { variable: string };
+const geistMono = { variable: "--font-geist-mono" } as { variable: string };
 
 export const metadata: Metadata = {
   title: "Create Next App",

@@ -1,15 +1,180 @@
 import { NextResponse } from "next/server";
 import { generateText } from "ai";
 import { google } from "@ai-sdk/google";
-import { getMongoDb, type DbAgent } from "@/lib/mongo";
+import { getMongoDb, type DbAgent, type DbAlert } from "@/lib/mongo";
+import { Client, PrivateKey, TopicMessageSubmitTransaction } from "@hashgraph/sdk";
 
 export const runtime = "nodejs";
 
+type Meta = { owner?: string; hederaAccountId?: string } | undefined;
+
+async function getBaselinePriceUsd(): Promise<number> {
+  try {
+    const endpoint = process.env.PYTH_HERMES_URL || "https://hermes.pyth.network";
+    const feedId = process.env.PYTH_PRICE_ID_HBAR_USD || "3728e591097635310e6341af53db8b7ee42da9b3a8d918f9463ce9cca886dfbd";
+    const url = `${endpoint.replace(/\/$/, "")}/v2/updates/price/latest?ids[]=${encodeURIComponent(feedId)}&parsed=true`;
+    const r = await fetch(url, { cache: "no-store" });
+    const j = (await r.json()) as { parsed?: Array<{ price?: { price?: number | string; expo?: number } }> };
+    const raw = Array.isArray(j?.parsed) ? j.parsed[0] : undefined;
+    const p = Number(raw?.price?.price ?? 0);
+    const e = Number(raw?.price?.expo ?? 0);
+    return Number.isFinite(p) && Number.isFinite(e) ? p * Math.pow(10, e) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isPriceQuestion(text: string): boolean {
+  const t = text.toLowerCase();
+  return /(hbar|hedera)/.test(t) && /(price|rate|value|quote)/.test(t);
+}
+
+function parseOperatorKey(raw: string): PrivateKey {
+  const s = String(raw || "").trim();
+  if (!s) throw new Error("Missing HEDERA_OPERATOR_KEY");
+  try { return PrivateKey.fromStringDer(s); } catch {}
+  try { return PrivateKey.fromStringED25519(s); } catch {}
+  try { return PrivateKey.fromStringECDSA(s); } catch {}
+  if (s.startsWith("0x")) {
+    const nox = s.slice(2);
+    try { return PrivateKey.fromStringDer(nox); } catch {}
+    try { return PrivateKey.fromStringED25519(nox); } catch {}
+    try { return PrivateKey.fromStringECDSA(nox); } catch {}
+  }
+  return PrivateKey.fromString(s);
+}
+
+function getHederaClient(): Client {
+  const network = (process.env.HEDERA_NETWORK || "testnet").toLowerCase();
+  const operatorId = process.env.HEDERA_OPERATOR_ID;
+  const operatorKey = process.env.HEDERA_OPERATOR_KEY;
+  if (!operatorId || !operatorKey) throw new Error("Missing operator credentials");
+  let client: Client;
+  if (network === "mainnet") client = Client.forMainnet();
+  else if (network === "previewnet") client = Client.forPreviewnet();
+  else client = Client.forTestnet();
+  client.setOperator(operatorId, parseOperatorKey(operatorKey));
+  return client;
+}
+
+async function tryImmediateTradeFromText(text: string, meta: Meta): Promise<{ done?: boolean; message?: string; txId?: string }> {
+  const t = String(text || "").toLowerCase();
+  const m = t.match(/\b(buy|sell)\b[\s:]*([\$]?\s*\d+(?:\.\d+)?(?:\s*[\$usd]+)?|\d+(?:\.\d+)?\s*hbar)/i);
+  if (!m) return {};
+  const action = m[1].toLowerCase() as "buy" | "sell";
+  const amtRaw = m[2].replace(/\s+/g, "");
+  const unit: "usd" | "hbar" = /hbar$/i.test(amtRaw) ? "hbar" : /\$|usd$/i.test(amtRaw) ? "usd" : "hbar";
+  const amountStr = amtRaw.replace(/hbar|\$|usd/gi, "");
+  const amount = Number(amountStr);
+  if (!Number.isFinite(amount) || amount <= 0) return {};
+
+  // Publish to HCS topic immediately
+  const topicId = action === "sell" ? process.env.HEDERA_SIGNAL_TOPIC_SELL : process.env.HEDERA_SIGNAL_TOPIC_BUY;
+  if (!topicId) return {};
+  const client = getHederaClient();
+  const payload = {
+    kind: "trade_signal",
+    action,
+    amount,
+    unit,
+    owner: meta?.owner || null,
+    hederaAccountId: meta?.hederaAccountId || null,
+    ts: new Date().toISOString(),
+    note: "immediate_request",
+  };
+  const submit = await new TopicMessageSubmitTransaction().setTopicId(topicId).setMessage(JSON.stringify(payload)).execute(client);
+  const txId = submit.transactionId?.toString();
+  const net = (process.env.HEDERA_NETWORK || "testnet").toLowerCase();
+  const hashscanBase = net === "mainnet" ? "https://hashscan.io/mainnet/transaction/" : net === "previewnet" ? "https://hashscan.io/previewnet/transaction/" : "https://hashscan.io/testnet/transaction/";
+  const link = txId ? `${hashscanBase}${encodeURIComponent(txId)}` : "";
+  const linkPart = link ? ` (${link})` : "";
+  return { done: true, message: `Recorded ${action} ${amount} ${unit.toUpperCase()} request. Tx: ${txId || "(pending)"}${linkPart}.`, txId };
+}
+
+async function tryCreateAlertFromText(text: string, meta: Meta): Promise<{ created?: boolean; message?: string; alertId?: string }> {
+  const t = String(text || "").toLowerCase();
+  if (!/\bhbar\b|\bhedera\b/.test(t)) return {};
+
+  // Extract percent either before or after direction words
+  const pctMatch = t.match(/(\d+(?:\.\d+)?)\s*%/);
+  const dirMatch = t.match(/\b(up|down|drop|drops|rise|rises|increase|increases|decrease|decreases|fall|falls)\b/);
+  if (!pctMatch || !dirMatch) return {};
+  const pct = Number(pctMatch[1]);
+  if (!Number.isFinite(pct) || pct <= 0) return {};
+  const dir = dirMatch[1];
+
+  // Determine action and amount if present
+  const buyAmtMatch = t.match(/\bbuy\b\s*(\d+(?:\.\d+)?)\s*hbar/);
+  const sellAmtMatch = t.match(/\bsell\b\s*(\d+(?:\.\d+)?)\s*hbar/);
+  const action: DbAlert["action"] = sellAmtMatch ? "sell" : buyAmtMatch ? "buy" : /\bnotify\b|\balert\b|\btell\s*me\b/.test(t) ? "notify" : (/(buy|sell)/.test(t) ? (t.includes("sell") ? "sell" : "buy") : "notify");
+  const hbarAmount = action === "notify" ? 0 : Number((buyAmtMatch?.[1] || sellAmtMatch?.[1] || 1));
+  if (action !== "notify" && (!Number.isFinite(hbarAmount) || hbarAmount <= 0)) return {};
+
+  const downWords = ["down", "drop", "drops", "decrease", "decreases", "fall", "falls"];
+  const triggerType: DbAlert["triggerType"] = downWords.includes(dir) ? "percent_drop" : "percent_rise";
+
+  const hederaAccountId = meta?.hederaAccountId || "";
+  const owner = meta?.owner;
+  const toAccountId = process.env.HEDERA_TRADE_SINK_ACCOUNT_ID || process.env.HEDERA_OPERATOR_ID || "";
+  if (!hederaAccountId) return {};
+
+  const db = await getMongoDb();
+  const now = new Date();
+  const baselinePrice = await getBaselinePriceUsd();
+  const alert: DbAlert = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    owner,
+    hederaAccountId,
+    toAccountId: toAccountId || undefined,
+    hbarAmount: action === "notify" ? 0 : hbarAmount,
+    action,
+    triggerType,
+    triggerValue: pct,
+    baselinePrice: baselinePrice || 0,
+    cooldownSec: 3600,
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
+  };
+  await db.collection<DbAlert>("alerts").insertOne(alert as unknown as DbAlert);
+
+  const verb = action === "notify" ? "notify" : action;
+  const amountText = action === "notify" ? "" : ` ${hbarAmount} HBAR`;
+  const dirText = triggerType === "percent_drop" ? "drops" : "rises";
+  return { created: true, message: `Okay, alert set: ${verb}${amountText} when price ${dirText} ${pct}%.`, alertId: alert.id };
+}
+
 export async function POST(request: Request) {
   try {
-    const { persona, question }: { persona?: string; question?: string } = await request.json();
+    const { persona, question, meta }: { persona?: string; question?: string; meta?: Meta } = await request.json();
     const trace: string[] = [];
     const apiKeyMissing = !process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+
+    // If user asked for current HBAR price, answer directly from Pyth
+    if (isPriceQuestion(String(question || ""))) {
+      const price = await getBaselinePriceUsd();
+      if (price) {
+        return NextResponse.json({ answer: `HBAR price: $${price.toFixed(6)} (Pyth)`, trace: ["Rate Oracle: fetched from Pyth"] }, { status: 200 });
+      }
+    }
+
+    // If user asked for immediate buy/sell with amount, record a trade signal now and return the transaction id
+    try {
+      const instant = await tryImmediateTradeFromText(String(question || ""), meta);
+      if (instant.done) {
+        trace.push("Swap Executor: recorded trade signal on HCS");
+        return NextResponse.json({ answer: instant.message || "Recorded.", trace, txId: instant.txId }, { status: 200 });
+      }
+    } catch {}
+
+    // Try handling trade alert intent first
+    try {
+      const intent = await tryCreateAlertFromText(String(question || ""), meta);
+      if (intent.created) {
+        trace.push("Orchestrator: created trade alert");
+        return NextResponse.json({ answer: intent.message || "Alert created.", trace, alertId: intent.alertId }, { status: 200 });
+      }
+    } catch {}
 
     // Load agents from MongoDB at runtime
     let agents: Pick<DbAgent, "id" | "name" | "purpose" | "context">[] = [];

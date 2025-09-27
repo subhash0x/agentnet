@@ -29,8 +29,9 @@ export async function POST(request: Request) {
     const client = getClient();
     const key = parseKey(privateKey);
 
-    const tx = await new ScheduleSignTransaction().setScheduleId(scheduleId).freezeWith(client).sign(key).execute(client);
-    const receipt = await tx.getReceipt(client);
+    const prepared = await new ScheduleSignTransaction().setScheduleId(scheduleId).freezeWith(client).sign(key);
+    const submit = await prepared.execute(client);
+    const receipt = await submit.getReceipt(client);
 
     const info = await new ScheduleInfoQuery().setScheduleId(scheduleId).execute(client);
 

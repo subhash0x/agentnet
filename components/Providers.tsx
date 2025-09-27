@@ -5,6 +5,7 @@ import { Web3AuthProvider } from "@web3auth/modal/react";
 import { WagmiProvider } from "@web3auth/modal/react/wagmi";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import web3AuthContextConfig from "./web3AuthContext";
+import AlertsToaster from "@/components/alerts/AlertsToaster";
 
 export default function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = React.useState(() => new QueryClient());
@@ -14,6 +15,7 @@ export default function Providers({ children }: { children: React.ReactNode }) {
       <QueryClientProvider client={queryClient}>
         <WagmiProvider>
           {children}
+          <AlertsToaster />
         </WagmiProvider>
       </QueryClientProvider>
     </Web3AuthProvider>

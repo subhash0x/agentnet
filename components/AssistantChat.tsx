@@ -49,12 +49,20 @@ export default function AssistantChat({ graph, onGraph }: { graph?: AgentGraph; 
 		// If a parent provides onGraph, we leave the current graph unchanged
 
 		try {
+			let meta: { owner?: string; hederaAccountId?: string } | undefined;
+			try {
+				const raw = localStorage.getItem("hedera.account");
+				if (raw) {
+					const j = JSON.parse(raw) as { ownerEvm?: string; accountId?: string };
+					meta = { owner: j?.ownerEvm, hederaAccountId: j?.accountId };
+				}
+			} catch {}
 			const res = await fetch("/api/agents/answer", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ persona, question: userText }),
+				body: JSON.stringify({ persona, question: userText, meta }),
 			});
-			const data = (await res.json()) as { answer: string; trace?: string[]; activations?: string[] };
+			const data = (await res.json()) as { answer: string; trace?: string[]; activations?: string[]; alertId?: string };
 			const traceMsgs = Array.isArray(data?.trace) ? data.trace : [];
 			// Show steps progressively with small delays and highlight inferred agents
 			if (showSteps && traceMsgs.length) {
@@ -82,6 +90,60 @@ export default function AssistantChat({ graph, onGraph }: { graph?: AgentGraph; 
 			} catch {}
 			await new Promise((r) => setTimeout(r, traceMsgs.length ? 300 : 0));
 			setMessages((m) => [...m, { role: "assistant", text: data.answer }]);
+
+			// If an alert was created, start a 5s poll loop to show price and auto execute
+			if (data.alertId) {
+				try {
+					const hederaRaw = localStorage.getItem("hedera.account");
+					const hedera = hederaRaw ? (JSON.parse(hederaRaw) as { accountId?: string; privateKey?: string }) : null;
+					let stop = false;
+					for (let i = 0; i < 60 && !stop; i++) {
+						// Fetch Pyth directly every 1s for a true realtime view
+						try {
+							const endpoint = process.env.NEXT_PUBLIC_PYTH_HERMES_URL || "https://hermes.pyth.network";
+							const feedId = process.env.NEXT_PUBLIC_PYTH_PRICE_ID_HBAR_USD || "3728e591097635310e6341af53db8b7ee42da9b3a8d918f9463ce9cca886dfbd";
+							const url = `${endpoint.replace(/\/$/, "")}/v2/updates/price/latest?ids[]=${encodeURIComponent(feedId)}&parsed=true`;
+							const pr = await fetch(url, { cache: "no-store" });
+							const pj = (await pr.json()) as { parsed?: Array<{ price?: { price?: number | string; expo?: number } }> };
+							const raw = Array.isArray(pj?.parsed) ? pj.parsed[0] : undefined;
+							const pp = Number(raw?.price?.price ?? 0);
+							const pe = Number(raw?.price?.expo ?? 0);
+							const price = Number.isFinite(pp) && Number.isFinite(pe) ? pp * Math.pow(10, pe) : 0;
+							setMessages((m) => [...m, { role: "assistant", text: `HBAR price: $${Number(price || 0).toFixed(6)}` }]);
+						} catch {}
+						// trigger backend check so schedule is created when threshold hits
+						try { await fetch("/api/alerts/check", { method: "POST" }); } catch {}
+						// Check if backend wrote an HCS signal for this alert (messageSequence present)
+						const aRes = await fetch(`/api/alerts?id=${encodeURIComponent(data.alertId)}`);
+						const aj = (await aRes.json()) as { alert?: { scheduleId?: string; topicId?: string; messageSequence?: number; action?: string } };
+						const scheduleId = aj?.alert?.scheduleId;
+						if (scheduleId && hedera?.privateKey) {
+							const sRes = await fetch("/api/hedera/schedule/sign", {
+								method: "POST",
+								headers: { "Content-Type": "application/json" },
+								body: JSON.stringify({ scheduleId, privateKey: hedera.privateKey }),
+							});
+							if (sRes.ok) {
+								setMessages((m) => [...m, { role: "assistant", text: "Order executed via scheduled transaction." }]);
+								stop = true;
+								break;
+							}
+						}
+						const seq = aj?.alert?.messageSequence;
+						if (typeof seq === "number" && seq > 0) {
+							const net = (process.env.NEXT_PUBLIC_HEDERA_NETWORK || process.env.HEDERA_NETWORK || "testnet").toLowerCase();
+							const base = net === "mainnet" ? "https://hashscan.io/mainnet/topic/" : net === "previewnet" ? "https://hashscan.io/previewnet/topic/" : "https://hashscan.io/testnet/topic/";
+							const link = aj?.alert?.topicId ? `${base}${aj.alert.topicId}` : "";
+							const act = (aj?.alert?.action || "notify").toLowerCase();
+							const msg = act === "notify" ? `Alert fired. Seq #${seq}.${link ? " (" + link + ")" : ""}` : `Order signal published (${act}). Seq #${seq}.${link ? " (" + link + ")" : ""}`;
+							setMessages((m) => [...m, { role: "assistant", text: msg }]);
+							stop = true;
+							break;
+						}
+						await new Promise((r) => setTimeout(r, 1000));
+					}
+				} catch {}
+			}
       } catch {
 			setMessages((m) => [...m, { role: "assistant", text: "Sorry, I couldn't generate an answer right now." }]);
 		} finally {

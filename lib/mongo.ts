@@ -52,3 +52,26 @@ export type DbAgent = {
 };
 
 
+export type DbAlert = {
+  id: string;
+  owner?: string; // wallet address or user id
+  hederaAccountId: string; // source account to spend
+  toAccountId?: string; // optional destination (not required for HCS recording)
+  hbarAmount: number; // amount to trade when triggered (0 allowed for notify)
+  action: "buy" | "sell" | "notify"; // intent to record or notify-only
+  triggerType: "percent_drop" | "percent_rise";
+  triggerValue: number; // e.g., 10 means 10%
+  baselinePrice: number; // captured at creation
+  cooldownSec?: number; // default 3600
+  status: "active" | "paused" | "completed" | "cancelled";
+  scheduleId?: string; // legacy (if we later re-enable scheduled transfers)
+  scheduledTxId?: string; // legacy
+  topicId?: string; // HCS topic used to record signals
+  messageSequence?: number; // HCS sequence number of last signal
+  lastCheckedAt?: Date;
+  lastNotifiedAt?: Date;
+  createdAt?: Date;
+  updatedAt?: Date;
+};
+
+
