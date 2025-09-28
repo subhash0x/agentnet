@@ -4,6 +4,7 @@ const uri = process.env.MONGODB_URI || "";
 if (!uri) {
   // Don't throw at import time to avoid Next.js build issues on client side imports.
   // Server-side routes should validate before use.
+  console.warn("MONGODB_URI environment variable is not set");
 }
 
 declare global {
@@ -37,7 +38,12 @@ if (process.env.NODE_ENV === "development") {
 }
 
 export async function getMongoDb(dbName = process.env.MONGODB_DB || "atoa") {
-  if (!uri) throw new Error("MONGODB_URI is not set");
+  if (!uri) {
+    throw new Error("MONGODB_URI is not set. Please check your environment variables.");
+  }
+  if (!uri.startsWith("mongodb://") && !uri.startsWith("mongodb+srv://")) {
+    throw new Error(`Invalid MongoDB URI format. Expected to start with "mongodb://" or "mongodb+srv://", got: ${uri.substring(0, 20)}...`);
+  }
   const client = await clientPromise;
   return client.db(dbName);
 }
